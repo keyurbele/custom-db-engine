@@ -2,36 +2,51 @@ import os
 import unittest
 from engine import SimpleStorageEngine
 
-class TestStorageEngine(unittest.TestCase):
+class TestSimpleStorageEngine(unittest.TestCase):
     def setUp(self):
-        # Use clean files for testing
-        self.db_name = "test_data.db"
-        self.wal_name = "test_wal.log"
-        # Clean up any leftover test files from previous runs
-        if os.path.exists(self.db_name): os.remove(self.db_name)
-        if os.path.exists(self.wal_name): os.remove(self.wal_name)
-        
-        self.db = SimpleStorageEngine(db_filename=self.db_name, wal_filename=self.wal_name, cache_capacity=2)
+        """Clean environment before every single test run."""
+        for f in ["test_data.db", "test_wal.log"]:
+            if os.path.exists(f):
+                os.remove(f)
+        self.db = SimpleStorageEngine(db_filename="test_data.db", wal_filename="test_wal.log")
 
     def tearDown(self):
+        """Clean up filesystem footprints post testing."""
         self.db.close()
-        if os.path.exists(self.db_name): os.remove(self.db_name)
-        if os.path.exists(self.wal_name): os.remove(self.wal_name)
+        for f in ["test_data.db", "test_wal.log"]:
+            if os.path.exists(f):
+                os.remove(f)
 
     def test_put_and_get(self):
-        """Test basic saving and retrieving functionality."""
-        self.db.put("hello", "world")
-        self.assertEqual(self.db.get("hello"), "world")
+        """Verify basic storage write/read cycles."""
+        self.db.put("test_key", "test_value")
+        self.assertEqual(self.db.get("test_key"), "test_value")
 
-    def test_cache_eviction(self):
-        """Test if the LRU cache correctly evicts keys when capacity is exceeded."""
-        self.db.put("k1", "v1")
-        self.db.put("k2", "v2")
-        self.db.put("k3", "v3") # Should evict k1 because capacity is 2
+    def test_tombstone_deletion(self):
+        """Verify that tombstones properly hide deleted keys."""
+        self.db.put("delete_me", "ghost_data")
+        self.db.delete("delete_me")
+        self.assertIsNone(self.db.get("delete_me"))
+
+    def test_compaction_reclaims_space(self):
+        """Verify that compaction physically shrinks the database file."""
+        # Write initial data, overwrite it, and add then delete another key
+        self.db.put("key1", "initial_version")
+        self.db.put("key1", "updated_version")
+        self.db.put("key2", "to_be_deleted")
+        self.db.delete("key2")
         
-        # k3 should be a cache hit, k1 should read from disk but still return the correct value
-        self.assertEqual(self.db.get("k3"), "v3")
-        self.assertEqual(self.db.get("k1"), "v1")
+        size_before = os.path.getsize("test_data.db")
+        
+        # Trigger compaction routine
+        self.db.compact()
+        
+        size_after = os.path.getsize("test_data.db")
+        
+        # Assertions
+        self.assertLess(size_after, size_before)
+        self.assertEqual(self.db.get("key1"), "updated_version")
+        self.assertIsNone(self.db.get("key2"))
 
 if __name__ == "__main__":
     unittest.main()

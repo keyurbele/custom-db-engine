@@ -1,6 +1,6 @@
 import os
 import struct
-import threading  # NEW: Import Python's threading system
+import threading
 import time
 from collections import OrderedDict
 
@@ -16,14 +16,13 @@ class SimpleStorageEngine:
         self.cache = OrderedDict()
         self.cache_capacity = cache_capacity
         
-        # NEW: Create a Thread Lock to ensure only one thread writes to disk at a time!
         self.lock = threading.Lock()
         
         self._recover_from_wal()
         self._load_index()
 
     def _recover_from_wal(self):
-        """Scans the WAL file on startup for automatic crash recovery."""
+        """Scans the WAL file on startup for automatic crash recovery using 7-byte headers."""
         self.wal_file.seek(0, os.SEEK_END)
         wal_size = self.wal_file.tell()
         if wal_size == 0:
@@ -33,10 +32,10 @@ class SimpleStorageEngine:
         self.wal_file.seek(0)
         
         while self.wal_file.tell() < wal_size:
-            header = self.wal_file.read(6)
-            if not header or len(header) < 6:
+            header = self.wal_file.read(7)
+            if not header or len(header) < 7:
                 break
-            key_len, value_len = struct.unpack('>HI', header)
+            record_type, key_len, value_len = struct.unpack('>BHI', header)
             key_bytes = self.wal_file.read(key_len)
             value_bytes = self.wal_file.read(value_len)
             
@@ -49,117 +48,194 @@ class SimpleStorageEngine:
         print("🎉 Recovery complete! Main database restored.")
 
     def put(self, key: str, value: str):
-        """Saves data safely using a Thread Lock to prevent multi-user corruption."""
-        # NEW: Acquire the lock. If another user is writing, this user waits in line automatically.
+        """Saves data safely using a Thread Lock and 7-byte active record headers."""
         with self.lock:
             key_bytes = key.encode('utf-8')
             value_bytes = value.encode('utf-8')
             
-            header = struct.pack('>HI', len(key_bytes), len(value_bytes))
+            # Record Type 0 = Active Data
+            header = struct.pack('>BHI', 0, len(key_bytes), len(value_bytes))
             record = header + key_bytes + value_bytes
             
-            # 1. Write to WAL
             self.wal_file.write(record)
             self.wal_file.flush()
             
-            # 2. Write to main disk database file
             offset = self.file.tell()
             self.file.write(record)
             self.file.flush()
             
-            # 3. Clear WAL entry
             self.wal_file.seek(0)
             self.wal_file.truncate(0)
             
-            # 4. Update memory index
             self.index[key] = offset
             
-            # 5. Put it in the LRU Cache
             if key in self.cache:
                 self.cache.move_to_end(key)
             self.cache[key] = value
             
             if len(self.cache) > self.cache_capacity:
                 evicted_key, _ = self.cache.popitem(last=False)
-                print(f"🗑️ Cache Full! Evicted '{evicted_key}' from memory.")
                 
             print(f"🔒 [Thread {threading.current_thread().name}] Saved '{key}' safely!")
-        # The lock is automatically released here when exiting the 'with' block
+
+    def delete(self, key: str):
+        """NEW: Appends a Tombstone record to disk to mark a key as deleted."""
+        with self.lock:
+            if key not in self.index:
+                print(f"ℹ️ Key '{key}' not found. Nothing to delete.")
+                return
+
+            key_bytes = key.encode('utf-8')
+            # Record Type 1 = Tombstone (Value size is 0 bytes)
+            header = struct.pack('>BHI', 1, len(key_bytes), 0)
+            record = header + key_bytes
+
+            # 1. Write Tombstone to WAL
+            self.wal_file.write(record)
+            self.wal_file.flush()
+
+            # 2. Append Tombstone to main database file
+            self.file.write(record)
+            self.file.flush()
+
+            # 3. Clear WAL
+            self.wal_file.seek(0)
+            self.wal_file.truncate(0)
+
+            # 4. Evict from memory maps instantly
+            if key in self.index:
+                del self.index[key]
+            if key in self.cache:
+                del self.cache[key]
+
+            print(f"🪦 [Thread {threading.current_thread().name}] Placed Tombstone for '{key}'!")
 
     def get(self, key: str) -> str:
-        """Looks up a key. Thread-safe reading using the lock."""
+        """Looks up a key. Thread-safe reading using 7-byte layout."""
         with self.lock:
-            # 1. Check the LRU Cache first
             if key in self.cache:
-                print(f"⚡ [Thread {threading.current_thread().name}] Cache HIT for '{key}'")
-                self.cache.move_to_end(key)
                 return self.cache[key]
                 
-            # 2. Cache Miss! Look at disk index
             if key not in self.index:
                 return None
                 
-            print(f"🐢 [Thread {threading.current_thread().name}] Cache MISS for '{key}', reading disk...")
             offset = self.index[key]
             self.file.seek(offset)
             
-            header = self.file.read(6)
-            key_len, value_len = struct.unpack('>HI', header)
-            self.file.seek(offset + 6 + key_len)
+            header = self.file.read(7)
+            record_type, key_len, value_len = struct.unpack('>BHI', header)
+            
+            # Defensive check: if it's somehow a tombstone, return None
+            if record_type == 1:
+                return None
+                
+            self.file.seek(offset + 7 + key_len)
             value_bytes = self.file.read(value_len)
             value = value_bytes.decode('utf-8')
             
-            # 3. Save to cache
             self.cache[key] = value
             if len(self.cache) > self.cache_capacity:
-                evicted_key, _ = self.cache.popitem(last=False)
-                print(f"🗑️ Cache Full! Evicted '{evicted_key}' from memory.")
+                self.cache.popitem(last=False)
                 
             return value
 
+    def compact(self):
+        """NEW: Reclaims wasted hard drive space by purging dead keys and old duplicates."""
+        print("\n🧹 Starting Disk Compaction Engine...")
+        with self.lock:
+            compaction_file_name = "compacted.db.tmp"
+            
+            # Close existing handle to ensure everything is flushed to current database
+            self.file.close()
+            
+            # Read from old file, write fresh data to new temporary file
+            with open(self.db_filename, "rb") as old_file, open(compaction_file_name, "wb") as new_file:
+                new_index = {}
+                old_file.seek(0, os.SEEK_END)
+                file_size = old_file.tell()
+                old_file.seek(0)
+                
+                while old_file.tell() < file_size:
+                    current_offset = old_file.tell()
+                    header = old_file.read(7)
+                    if not header or len(header) < 7:
+                        break
+                        
+                    record_type, key_len, value_len = struct.unpack('>BHI', header)
+                    key_bytes = old_file.read(key_len)
+                    key = key_bytes.decode('utf-8')
+                    
+                    # Read value bytes out of the way to move file pointer accurately
+                    value_bytes = old_file.read(value_len)
+                    
+                    # Core Logic: Only copy the record if it matches our active memory map offset!
+                    # This completely drops tombstones and old versions of overwritten keys.
+                    if key in self.index and self.index[key] == current_offset:
+                        new_offset = new_file.tell()
+                        new_record = header + key_bytes + value_bytes
+                        new_file.write(new_record)
+                        new_index[key] = new_offset
+            
+            # Swap old uncompacted file out for the clean compacted one
+            os.remove(self.db_filename)
+            os.rename(compaction_file_name, self.db_filename)
+            
+            # Reopen the main file handle and load the updated clean index map
+            self.file = open(self.db_filename, "a+b")
+            self.index = new_index
+            print(f"🎉 Compaction Finished! New database index size: {len(self.index)} active items.\n")
+
     def _load_index(self):
-        """Scans the main file to build the fast RAM memory map."""
+        """Scans the main file to build the fast RAM memory map with Tombstone handling."""
         self.file.seek(0, os.SEEK_END)
         file_size = self.file.tell()
         self.file.seek(0)
         
         while self.file.tell() < file_size:
             current_offset = self.file.tell()
-            header = self.file.read(6)
-            if not header or len(header) < 6:
+            header = self.file.read(7)
+            if not header or len(header) < 7:
                 break
-            key_len, value_len = struct.unpack('>HI', header)
+            record_type, key_len, value_len = struct.unpack('>BHI', header)
             key_bytes = self.file.read(key_len)
             key = key_bytes.decode('utf-8')
-            self.index[key] = current_offset
+            
+            if record_type == 1: # Tombstone encountered
+                if key in self.index:
+                    del self.index[key]
+            else: # Active data record
+                self.index[key] = current_offset
+                
             self.file.seek(value_len, os.SEEK_CUR)
 
     def close(self):
-        self.wal_file.close()
-        self.file.close()
-
-# NEW: Worker function to simulate multiple users slamming the database at the same time
-def simulate_user(db, user_id):
-    for i in range(2):
-        db.put(f"user_{user_id}_key_{i}", f"value_{i}")
-        time.sleep(0.1)  # Simulate small gap between requests
-        db.get(f"user_{user_id}_key_{i}")
+        if not self.file.closed:
+            self.file.close()
+        if not self.wal_file.closed:
+            self.wal_file.close()
 
 if __name__ == "__main__":
-    db = SimpleStorageEngine(cache_capacity=5)
+    # Clean up files from previous project phases for our new protocol
+    for f in ["data.db", "wal.log"]:
+        if os.path.exists(f): os.remove(f)
+
+    db = SimpleStorageEngine()
     
-    print("--- Starting Concurrency Simulation (Multiple Threads Running At Once) ---")
+    print("--- 1. Testing Overwrites & Deletions ---")
+    db.put("username", "player1")
+    db.put("username", "player2") # Overwrite old data chunk
+    db.put("score", "100")
+    db.delete("score")            # Drop data chunk via Tombstone
     
-    threads = []
-    # Create 3 separate virtual users running at the exact same time
-    for name in ["Alice", "Bob", "Charlie"]:
-        t = threading.Thread(target=simulate_user, args=(db, name), name=name)
-        threads.append(t)
-        t.start()
-        
-    # Wait for all users to finish up before closing the DB
-    for t in threads:
-        t.join()
-        
+    print(f"Current Value for 'username': {db.get('username')}")
+    print(f"Current Value for 'score': {db.get('score')}")
+    
+    print(f"Physical file size before compaction: {os.path.getsize('data.db')} bytes")
+    
+    # 2. Trigger Compaction Engine to sweep dead weights
+    db.compact()
+    
+    print(f"Physical file size after compaction: {os.path.getsize('data.db')} bytes")
+    print(f"Value check post-compaction: {db.get('username')}")
+    
     db.close()
-    print("--- Simulation Finished Safely Without Corruption! ---")
