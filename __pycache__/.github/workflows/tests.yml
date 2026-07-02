@@ -1,0 +1,19 @@
+name: Python Automated Testing Suite
+
+on: [push, pull_request]
+
+jobs:
+  run-tests:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Code from GitHub
+      uses: actions/checkout@v4
+
+    - name: Set Up Cloud Python Environment
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+
+    - name: Execute Automated Database Tests
+      run: python test_engine.py
