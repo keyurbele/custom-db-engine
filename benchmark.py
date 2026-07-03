@@ -1,6 +1,5 @@
 import os
 import time
-import threading
 from engine import SimpleStorageEngine
 
 def run_benchmarks():
@@ -8,11 +7,11 @@ def run_benchmarks():
     for f in ["bench_data.db", "bench_wal.log"]:
         if os.path.exists(f): os.remove(f)
 
-    # Higher cache capacity for high-speed benchmarking runs
-    db = SimpleStorageEngine(db_filename="bench_data.db", wal_filename="bench_wal.log", cache_capacity=1000)
+    # High capacity to stress memory mapping throughput
+    db = SimpleStorageEngine(db_filename="bench_data.db", wal_filename="bench_wal.log", cache_capacity=5000)
     
-    total_ops = 5000
-    print(f"🚀 Launching Stress Tests ({total_ops} operations)...")
+    total_ops = 10000
+    print(f"🚀 Launching Stress Tests ({total_ops} operations via mmap)...")
 
     # 1. Benchmark Sequential Writes
     start_time = time.time()
@@ -28,9 +27,10 @@ def run_benchmarks():
     read_duration = time.time() - start_time
     read_ops_sec = total_ops / read_duration
 
-    print("\n--- 📈 BENCHMARK METRICS ---")
-    print(f"✨ Writes: {total_ops} ops in {write_duration:.2f}s ({write_ops_sec:.2f} ops/sec)")
-    print(f"✨ Reads (Cache-Driven): {total_ops} ops in {read_duration:.2f}s ({read_ops_sec:.2f} ops/sec)")
+    print("\n--- 📈 PHASE 8 BENCHMARK METRICS ---")
+    print(f"✨ Mapped Writes: {total_ops} ops in {write_duration:.2f}s ({write_ops_sec:.2f} ops/sec)")
+    print(f"✨ Mapped Reads : {total_ops} ops in {read_duration:.2f}s ({read_ops_sec:.2f} ops/sec)")
+    print(f"📦 Total Allocated DB Storage Size: {db.db_size} bytes")
     
     db.close()
     
