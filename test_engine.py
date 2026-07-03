@@ -1,7 +1,6 @@
 import os
 import unittest
-import mmap
-from engine import SimpleStorageEngine, PAGE_SIZE
+from engine import SimpleStorageEngine
 
 class TestSimpleStorageEngine(unittest.TestCase):
     def setUp(self):
@@ -14,37 +13,40 @@ class TestSimpleStorageEngine(unittest.TestCase):
         for f in ["test_data.db", "test_wal.log"]:
             if os.path.exists(f): os.remove(f)
 
-    def test_mmap_initialization(self):
-        """Verify the database initializes with a valid memory map and page structure."""
-        self.assertTrue(hasattr(self.db, 'mm'))
-        self.assertIsInstance(self.db.mm, mmap.mmap)
-        self.assertEqual(self.db.db_size, PAGE_SIZE)
+    def test_bplus_tree_put_and_get(self):
+        """Verify point lookups function accurately through the B+ Tree index."""
+        self.db.put("key1", "val1")
+        self.db.put("key2", "val2")
+        self.assertEqual(self.db.get("key1"), "val1")
+        self.assertEqual(self.db.get("key2"), "val2")
 
-    def test_put_and_get_via_mmap(self):
-        """Verify data can be written and read directly through memory slices."""
-        self.db.put("cloud_key", "cloud_value")
-        self.assertEqual(self.db.get("cloud_key"), "cloud_value")
-
-    def test_page_auto_allocation(self):
-        """Verify the engine dynamically allocates new 4KB pages when data overflows."""
-        initial_size = self.db.db_size
+    def test_bplus_tree_range_search(self):
+        """Verify range queries traverse leaf pointers in sorted order."""
+        self.db.put("a", "1")
+        self.db.put("c", "3")
+        self.db.put("b", "2")
+        self.db.put("d", "4")
         
-        # Write a massive value to force page scaling past the initial 4KB boundary
-        large_value = "X" * 5000
-        self.db.put("large_key", large_value)
-        
-        # Assert database grew by at least one page size
-        self.assertGreater(self.db.db_size, initial_size)
-        self.assertEqual(self.db.get("large_key"), large_value)
+        # Scan a subset range
+        results = self.db.get_range("b", "c")
+        self.assertEqual(len(results), 2)
+        self.assertEqual(results["b"], "2")
+        self.assertEqual(results["c"], "3")
+        self.assertNotIn("a", results)
+        self.assertNotIn("d", results)
 
-    def test_mmap_compaction(self):
-        """Verify memory map compaction strips dead records cleanly."""
+    def test_tombstone_deletion_bplus(self):
+        """Verify deletions remove pointers correctly out of the B+ Tree leaf."""
+        self.db.put("ghost", "data")
+        self.db.delete("ghost")
+        self.assertIsNone(self.db.get("ghost"))
+
+    def test_compaction_with_bplus_tree(self):
+        """Verify disk compaction reconstructs a pristine B+ Tree index map."""
         self.db.put("k1", "v1")
-        self.db.put("k1", "v2") # Overwrite
-        self.db.delete("k1")   # Tombstone
-        
+        self.db.put("k1", "v2")
         self.db.compact()
-        self.assertIsNone(self.db.get("k1"))
+        self.assertEqual(self.db.get("k1"), "v2")
 
 if __name__ == "__main__":
     unittest.main()
